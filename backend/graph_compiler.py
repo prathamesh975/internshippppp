@@ -1,22 +1,38 @@
 from typing import Any, Callable, Dict, List, TypedDict, Annotated
 import json
 import operator
+import os
+import sys
+import importlib.util
 from collections import defaultdict
 from pydantic import BaseModel, Field
 
 from langgraph.graph import END, StateGraph, START
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langchain_aws import ChatBedrockConverse
-import os
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), "DocumentPredictionHandler"))
-from langgraph_flow_demo.tools import TOOL_REGISTRY
+from langchain_core.tools import tool
+from tools import TOOL_REGISTRY
+
 
 class RouterDecision(BaseModel):
     route_id: str = Field(description="The ID of the route to take")
 
+class MultiRouterDecision(BaseModel):
+    route_id: str = Field(
+        description="Exactly one route ID selected from the available routes."
+    )
+
 class OrchestratorDecision(BaseModel):
     route_ids: List[str] = Field(description="The IDs of the routes to take")
+
+class EvaluationDecision(BaseModel):
+    status: str = Field(
+        description="PASS or FAIL"
+    )
+
+    feedback: str = Field(
+        description="Reason if evaluation failed"
+    )
 
 def merge_dicts(a: dict, b: dict):
     if not a: return b
@@ -37,6 +53,8 @@ class FlowState(TypedDict, total=False):
 
 class DynamicGraphCompiler:
     def __init__(self, graph_json: Dict[str, Any], bedrock_client):
+        # Holds dynamically created "agent-as-tool" tools, keyed by both node_id and label
+        self.agent_tool_registry: Dict[str, Any] = {}
         self.flow = graph_json
         self.nodes = {node["id"]: node for node in self.flow.get("nodes", [])}
         self.edges = self.flow.get("edges", [])
@@ -71,7 +89,7 @@ class DynamicGraphCompiler:
         
         if not start_nodes:
             raise ValueError("Graph has no entry points (possible cycle with no inputs).")
-        router_nodes = [n for n in self.nodes.values() if n.get("data", {}).get("type") in ("router", "orchestrator_agent")]
+        router_nodes = [n for n in self.nodes.values() if n.get("data", {}).get("type") in ("router", "multi_router_agent", "orchestrator_agent")]
         router_ids = {n["id"] for n in router_nodes}
 
         for edge in self.edges:
@@ -120,6 +138,27 @@ class DynamicGraphCompiler:
                 breakpoints.append(nid)
 
         return builder.compile(checkpointer=checkpointer, interrupt_before=breakpoints)
+
+    def _resolve_tools(self, tool_names: List[str]) -> List[Any]:
+        """Resolve a list of tool names against the static registry, the
+        dynamic agent-as-tool registry, and connected external/MCP tools."""
+        import mcp_manager
+        resolved = []
+        for name in tool_names:
+            if name in TOOL_REGISTRY:
+                resolved.append(TOOL_REGISTRY[name])
+                print(f"[DEBUG GRAPH_COMPILER] Found '{name}' in TOOL_REGISTRY")
+            elif name in self.agent_tool_registry:
+                resolved.append(self.agent_tool_registry[name])
+                print(f"[DEBUG GRAPH_COMPILER] Found '{name}' in agent_tool_registry")
+            else:
+                ext_tool = mcp_manager.get_external_tool_by_name(name)
+                if ext_tool:
+                    resolved.append(ext_tool)
+                    print(f"[DEBUG GRAPH_COMPILER] Found '{name}' in external providers")
+                else:
+                    print(f"[DEBUG GRAPH_COMPILER] WARNING: Tool '{name}' not found anywhere!")
+        return resolved
 
     def _create_node_func(self, node_id: str) -> Callable[[FlowState], FlowState]:
         """Creates an async function for a specific LangGraph node."""
@@ -217,29 +256,14 @@ class DynamicGraphCompiler:
                 if not system_prompt:
                     system_prompt = field_value or "You are a helpful AI assistant."
 
-                import mcp_manager
-                bound_tools = []
                 print(f"[DEBUG GRAPH_COMPILER] Node {node_id} received tool_names from UI: {tool_names}")
-                for name in tool_names:
-                    if name in TOOL_REGISTRY:
-                        bound_tools.append(TOOL_REGISTRY[name])
-                        print(f"[DEBUG GRAPH_COMPILER] Found '{name}' in TOOL_REGISTRY")
-                    else:
-                        ext_tool = mcp_manager.get_external_tool_by_name(name)
-                        if ext_tool:
-                            bound_tools.append(ext_tool)
-                            print(f"[DEBUG GRAPH_COMPILER] Found '{name}' in external providers")
-                        else:
-                            print(f"[DEBUG GRAPH_COMPILER] WARNING: Tool '{name}' not found anywhere!")
-
+                bound_tools = self._resolve_tools(tool_names)
                 print(f"[DEBUG GRAPH_COMPILER] Final bound_tools length: {len(bound_tools)}")
 
                 try:
                     if bound_tools:
-                        agent = create_react_agent(self.model, tools=bound_tools, prompt=system_prompt)
-                        invoke_msgs = []
-                        for m in messages:
-                            invoke_msgs.append(m)
+                        agent = create_agent(model=self.model, tools=bound_tools, system_prompt=system_prompt)
+                        invoke_msgs = list(messages)
                         if agent_input and (not invoke_msgs or invoke_msgs[-1].get("content") != agent_input):
                             invoke_msgs.append({"role": "user", "content": agent_input})
                         if not invoke_msgs:
@@ -249,24 +273,82 @@ class DynamicGraphCompiler:
                         result = response["messages"][-1].content
                         input_payload = agent_input or "Hello"
                         schema_payload = str(tool_names)
-                        summary = f"Invoked ReAct Agent with {len(bound_tools)} tools"
+                        summary = f"Invoked Agent with {len(bound_tools)} tools"
                     else:
                         invoke_msgs = []
                         if system_prompt:
                             invoke_msgs.append(("system", system_prompt))
-                        if agent_input:
-                            invoke_msgs.append(("human", agent_input))
-                        else:
-                            invoke_msgs.append(("human", "Hello"))
+                        invoke_msgs.append(("human", agent_input or "Hello"))
 
                         response = await self.model.ainvoke(invoke_msgs)
                         result = response.content
+                        input_payload = agent_input or "Hello"
                         summary = "Invoked AI model (Haiku) directly"
                 except Exception as e:
                     result = f"Error calling model: {str(e)}"
                     summary = "Model invocation failed"
 
-            elif node_type in ("router", "orchestrator_agent"):
+            elif node_type == "agent_as_a_tool":
+                
+                agent_input = ""
+                system_prompt = ""
+                tool_names = []
+
+                for edge in self.incoming[node_id]:
+                    if edge.get("targetHandle") == "input":
+                        agent_input = str(values.get(edge["source"], ""))
+                    elif edge.get("targetHandle") == "prompt":
+                        system_prompt = str(values.get(edge["source"], ""))
+                    elif edge.get("targetHandle") == "tools":
+                        val = values.get(edge["source"])
+                        if isinstance(val, list):
+                            tool_names.extend([str(v).strip() for v in val])
+                        elif val:
+                            tool_names.append(str(val).strip())
+
+                if not system_prompt:
+                    system_prompt = field_value or "You are a helpful sub-agent."
+
+                child_tools = self._resolve_tools(tool_names)
+                child_agent = create_agent(model=self.model, tools=child_tools, system_prompt=system_prompt)
+
+                tool_description = data.get(
+                    "toolDescription",
+                    f"Delegate a task to the '{label}' sub-agent. System prompt: {system_prompt}",
+                )
+
+                def make_agent_tool(name: str, description: str, bound_agent):
+                    @tool(name, description=description)
+                    async def dynamic_agent_tool(query: str) -> str:
+                        response = await bound_agent.ainvoke(
+                            {"messages": [{"role": "user", "content": query}]}
+                        )
+                        return response["messages"][-1].content
+                    return dynamic_agent_tool
+
+                dynamic_tool = make_agent_tool(node_id, tool_description, child_agent)
+
+                # Register under both id and label so downstream nodes can reference either
+                self.agent_tool_registry[node_id] = dynamic_tool
+                self.agent_tool_registry[label] = dynamic_tool
+
+                try:
+                    if agent_input:
+                        response = await child_agent.ainvoke(
+                            {"messages": [{"role": "user", "content": agent_input}]}
+                        )
+                        result = response["messages"][-1].content
+                        input_payload = agent_input
+                        summary = f"Registered '{label}' as a tool and ran it directly"
+                    else:
+                        result = f"Agent '{label}' registered as callable tool '{node_id}'"
+                        summary = f"Registered agent as tool: {node_id}"
+                    schema_payload = str(tool_names)
+                except Exception as e:
+                    result = f"Error calling model: {str(e)}"
+                    summary = "Tool-as-agent invocation failed"
+
+            elif node_type in ("router", "multi_router_agent", "orchestrator_agent"):
                 agent_input = ""
                 system_prompt = ""
                 for edge in self.incoming[node_id]:
@@ -284,17 +366,48 @@ class DynamicGraphCompiler:
                     route_text = "No descriptions provided. Route dynamically."
                     
                 prompt = system_prompt or field_value or "Decide which routes to take."
-                full_prompt = f"{prompt}\\n\\nAvailable Routes:\\n{route_text}\\n\\nBased on the user input, choose the appropriate route{'s' if node_type == 'orchestrator_agent' else ''}. If no routes are applicable, you may return an empty list."
+                full_prompt = f"""
+                You are a strict routing agent.
+                Your ONLY responsibility is to select ONE route.
+
+                You will receive:
+
+                1. User input
+                2. Available routes
+                3. Description of every route
+
+                Rules:
+
+                - Select EXACTLY ONE route.
+                - Never select multiple routes.
+                - Never answer the user's question.
+                - Never explain your reasoning.
+                - Never invent route IDs.
+                - Only choose one of the provided route IDs.
+                - Choose the BEST matching route.
+                - If multiple routes seem valid, choose the single best one.
+                - If none perfectly matches, choose the closest valid route.
+                - Do not return an empty response.
+                - Output must follow the required schema exactly.
+
+                Available Routes:
+                {route_text}
+                """
+
                 
-                schema = RouterDecision if node_type == "router" else OrchestratorDecision
+                schema = (
+                    OrchestratorDecision
+                    if node_type == "orchestrator_agent"
+                    else MultiRouterDecision
+                )
                 llm = self.model.with_structured_output(schema)
                 
                 try:
                     response = await llm.ainvoke([("system", full_prompt), ("human", agent_input or "Hello")])
-                    if node_type == "router":
-                        decision = response.route_id
-                    else:
+                    if node_type == "orchestrator_agent":
                         decision = response.route_ids
+                    else:
+                        decision = response.route_id
                     
                     values[f"{node_id}_decision"] = decision
                     # passes the output
@@ -339,6 +452,66 @@ class DynamicGraphCompiler:
                 except Exception as e:
                     result = f"Error: {str(e)}"
                     summary = "Aggregator error"
+
+            elif node_type == "evaluator_agent":
+                generated_response = ""
+                system_prompt = ""
+
+                for edge in self.incoming[node_id]:
+
+                    if edge.get("targetHandle") == "input":
+                        generated_response = str(values.get(edge["source"], ""))
+
+                    elif edge.get("targetHandle") == "prompt":
+                        system_prompt = str(values.get(edge["source"], ""))
+
+                if not system_prompt:
+                    system_prompt = field_value or "You are an AI Evaluator. Assess the quality of the generated response based on the provided criteria."
+
+                llm = self.model.with_structured_output(EvaluationDecision)
+
+                response = await llm.ainvoke([
+                    ("system", system_prompt),
+                    ("human", f"Generated Response:\\n{generated_response}")
+                ])
+
+                result = response
+
+                values[f"{node_id}_status"] = response.status
+                values[f"{node_id}_feedback"] = response.feedback
+
+                input_payload = generated_response
+
+                summary = f"Evaluation: {response.status}"
+
+            elif node_type == "optimizer_agent":
+                draft = ""
+                feedback = ""
+                system_prompt = ""
+
+                for edge in self.incoming[node_id]:
+
+                    if edge.get("targetHandle") == "input":
+                        draft = str(values.get(edge["source"], ""))
+
+                    elif edge.get("targetHandle") == "feedback":
+                        feedback = str(values.get(edge["source"], ""))
+
+                    elif edge.get("targetHandle") == "prompt":
+                        system_prompt = str(values.get(edge["source"], ""))
+
+                if not system_prompt:
+                    system_prompt = field_value or "You are an AI Optimizer. Improve the draft based on the provided feedback."
+
+                response = await self.model.ainvoke([
+                    ("system", system_prompt),
+                    ("human", f"Draft:\\n{draft}\\n\\nFeedback:\\n{feedback}")
+                ])
+
+                result = response.content
+                input_payload = draft
+                summary = "Optimized response"
+
 
             elif node_type == "condition":
                 condition_input = ""

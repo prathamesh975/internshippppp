@@ -62,6 +62,12 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     resume: bool = False
 
+class GeneratePromptRequest(BaseModel):
+    agent_name: str
+    agent_type: str = "agent"
+    description: str = ""
+    tools: list[Dict[str, Any]] = []
+
 memory_saver = MemorySaver()
 REGION_NAME = "us-east-1"
 RETRY_CONFIG = Config(
@@ -191,6 +197,91 @@ async def get_external_provider_tools(provider: str):
 @app.get("/api/external-tools/all")
 async def get_all_ext_tools():
     return {"tools": get_all_external_tools()}
+
+
+@app.post("/api/generate-prompt")
+async def generate_prompt(request: GeneratePromptRequest):
+
+    compiler = DynamicGraphCompiler({}, bedrock_client)
+
+    tool_text = "\n".join(
+        f"- {tool['name']}: {tool.get('description', '')}"
+        for tool in request.tools
+    )
+
+    instruction = f"""
+    You are an expert AI prompt engineer.
+
+    Generate a professional system prompt.
+    
+    Agent Name: {request.agent_name}
+
+    Agent Type: {request.agent_type}
+
+    Description: {request.description}
+
+    Available tools: {tool_text}
+
+    The generated prompt must include:
+    -Role
+    -Responsibilities
+    -When each tool should be used
+    -Output style
+    -Constraints
+    -Error handling
+
+    Return ONLY the final system prompt.
+    """
+
+    response = await compiler.model.ainvoke([
+        ("system", "You are an expert AI prompt engineer."),
+        ("human", instruction)
+    ])
+
+    return {
+        "prompt": response.content
+    }
+
+
+ROUTE_REGISTRY = {}
+
+
+def register_route(
+    route_name: str,
+    description: str,
+    event_schema: dict,
+    handler=None,
+):
+    ROUTE_REGISTRY[route_name] = {
+        "description": description,
+        "event": event_schema,
+        "handler": handler,
+    }
+
+from route_registry import ROUTE_REGISTRY
+
+def lambda_handler(event, context):
+
+    route = event.get("route")
+
+    if route not in ROUTE_REGISTRY:
+        return {
+            "statusCode": 404,
+            "body": f"Unknown route: {route}"
+        }
+    
+    route_info = ROUTE_REGISTRY[route]
+
+    print("Route:", route)
+    print("Description:", route_info["description"])
+    print("Expected Event", route_info["event"])
+
+    return {
+        "statusCode": 200,
+        "route": route,
+        "description": route_info["description"],
+        "expected_event": route_info["event"]
+    }
 
 
 
