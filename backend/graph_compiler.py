@@ -241,7 +241,33 @@ class DynamicGraphCompiler:
                 
                 for edge in self.incoming[node_id]:
                     if edge.get("targetHandle") == "input":
-                        agent_input = str(values.get(edge["source"], ""))
+                        incoming = values.get(edge["source"], "")
+
+                        if isinstance(incoming, dict) and "user_input" in incoming:
+
+                            route_text = "\n".join(
+                                f"- {route}: {desc}"
+                                for route, desc in incoming.get("routes", {}).items()
+                            )
+
+                            agent_input = f"""
+                            You are the agent: {label}.
+
+                            User Request:
+                            {incoming["user_input"]}
+
+                            Workflow Routes:
+                            {route_text}
+
+                            You are executing as one branch of a parallel workflow.
+
+                            Only perform the responsibility of the "{label}" agent.
+                            Do NOT attempt to perform the work of the other routes.
+                            """
+
+                        else:
+                            agent_input = str(incoming)
+
                     elif edge.get("targetHandle") == "prompt":
                         system_prompt = str(values.get(edge["source"], ""))
                     elif edge.get("targetHandle") == "tools":
@@ -420,6 +446,33 @@ class DynamicGraphCompiler:
                     values[f"{node_id}_decision"] = [] if node_type == "orchestrator_agent" else ""
                     result = agent_input or "Hello"
                     summary = f"Routing error: {str(e)}"
+
+            elif node_type == "parallelizing_agent":
+                
+                user_input = ""
+                route_descriptions = {}
+
+                for edge in self.incoming[node_id]:
+                    if edge.get("targetHandle") == "input":
+                        user_input = str(values.get(edge["source"], ""))
+
+                if not user_input and messages:
+                        user_input = messages[-1].get("content", "")
+
+                route_descriptions = data.get("routeDescriptions", {})
+
+                result = {
+                        "user_input": user_input,
+                        "routes": route_descriptions
+                    }
+
+                input_payload = user_input
+                schema_payload = str(route_descriptions)
+
+                summary = f"Broadcasted to {len(self.outgoing[node_id])} parallel branches"
+                 
+
+
 
             elif node_type == "aggregator_agent":
                 aggregated_inputs = []
