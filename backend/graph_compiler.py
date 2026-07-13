@@ -11,6 +11,7 @@ from langgraph.graph import END, StateGraph, START
 from langchain.agents import create_agent
 from langchain_aws import ChatBedrockConverse
 from langchain_core.tools import tool
+from sqlalchemy import values
 from tools import TOOL_REGISTRY
 
 
@@ -49,7 +50,9 @@ class FlowState(TypedDict, total=False):
     messages: List[Dict[str, str]]  
     values: Annotated[Dict[str, Any], merge_dicts]  
     trace: Annotated[List[Dict[str, Any]], operator.add]  
-    final_response: Annotated[Any, keep_last]             
+    final_response: Annotated[Any, keep_last] 
+
+    retry_count: Annotated[int, keep_last]            
 
 class DynamicGraphCompiler:
     def __init__(self, graph_json: Dict[str, Any], bedrock_client):
@@ -121,6 +124,56 @@ class DynamicGraphCompiler:
             r_edges = [e for e in self.edges if e["source"] == r_id]
             builder.add_conditional_edges(r_id, make_condition(r_id, r_edges))
 
+        evaluator_nodes = [
+            n for n in self.nodes.values()
+            if n.get("data", {}).get("type") == "evaluator_agent"
+        ]
+
+        for evaluator in evaluator_nodes:
+
+            evaluator_id = evaluator["id"]
+
+            def make_eval_condition(eval_id):
+
+                def condition(state):
+
+                    values = state["values"]
+
+                    status = values.get(f"{eval_id}_status", "")
+
+                    retries = values.get("retry_count", 0)
+
+                    if status == "PASS":
+                        return "pass"
+
+                    if retries >= 3:
+                        return "pass"
+
+                    return "fail"
+
+                return condition
+
+                mapping = {}
+
+        outgoing = [
+            e for e in self.edges
+            if e["source"] == evaluator_id
+        ]
+
+        for edge in outgoing:
+
+            if edge["sourceHandle"] == "PASS":
+                mapping["pass"] = edge["target"]
+
+            elif edge["sourceHandle"] == "FAIL":
+                mapping["fail"] = edge["target"]
+
+        builder.add_conditional_edges(
+            evaluator_id,
+            make_eval_condition(evaluator_id),
+            mapping
+        )
+
         if len(start_nodes) == 1:
             builder.add_edge(START, start_nodes[0])
         else:
@@ -170,6 +223,7 @@ class DynamicGraphCompiler:
             field_value = data.get("fieldValue", data.get("selectedOption", data.get("toolName", "")))
             
             values = dict(state.get("values", {}))
+            retry_count = values.get("retry_count", 0)
             trace = []
             messages = list(state.get("messages", []))
             final_response = state.get("final_response")
@@ -532,6 +586,13 @@ class DynamicGraphCompiler:
 
                 values[f"{node_id}_status"] = response.status
                 values[f"{node_id}_feedback"] = response.feedback
+
+                if response.status.upper() == "FAIL":
+                    retry_count += 1
+
+                values["retry_count"] = retry_count
+
+                result = generated_response
 
                 input_payload = generated_response
 

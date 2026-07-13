@@ -258,7 +258,7 @@ def register_route(
         "handler": handler,
     }
 
-from route_registry import ROUTE_REGISTRY
+# from route_registry import ROUTE_REGISTRY
 
 def lambda_handler(event, context):
 
